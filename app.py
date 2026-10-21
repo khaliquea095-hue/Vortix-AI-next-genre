@@ -32,7 +32,7 @@ GEMINI = "Gemini (free)"
 CLAUDE = "Claude (paid)"
 PROVIDERS = [GEMINI, CLAUDE]
 MODELS = {  # first entry is the default; "Custom" lets you type any model ID
-    GEMINI: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
+    GEMINI: ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"],
     CLAUDE: ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"],
 }
 MISSING_KEY = {GEMINI: "GEMINI_API_KEY", CLAUDE: "ANTHROPIC_API_KEY"}

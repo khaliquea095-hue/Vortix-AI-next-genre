@@ -2,6 +2,8 @@
 Vortix AI: Streamlit app with chat, web search, image and PDF understanding,
 image creation, downloadable PDFs, saved chats, and 120+ assistant modes.
 
+The default AI is Google Gemini (free tier). Claude is optional if you add credit.
+
 Run locally:  streamlit run app.py
 Deploy free:  Streamlit Community Cloud, from a GitHub repo (see README.md)
 """
@@ -17,6 +19,8 @@ from pathlib import Path
 import anthropic
 import streamlit as st
 from fpdf import FPDF
+from google import genai
+from google.genai import types
 from openai import OpenAI
 
 from prompts import MASTER_PROMPT, MODES
@@ -24,8 +28,15 @@ from prompts import MASTER_PROMPT, MODES
 st.set_page_config(page_title="Vortix AI", page_icon="⚡", layout="centered")
 
 APP_NAME = "Vortix AI"
-CLAUDE_MODELS = ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"]
-IMAGE_MODEL = "gpt-image-1"  # change if your OpenAI account has a newer image model
+GEMINI = "Gemini (free)"
+CLAUDE = "Claude (paid)"
+PROVIDERS = [GEMINI, CLAUDE]
+MODELS = {  # first entry is the default; "Custom" lets you type any model ID
+    GEMINI: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
+    CLAUDE: ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"],
+}
+MISSING_KEY = {GEMINI: "GEMINI_API_KEY", CLAUDE: "ANTHROPIC_API_KEY"}
+IMAGE_MODEL = "gpt-image-1"  # OpenAI image model (paid). Change if you have a newer one.
 FEATURES = ["Chat", "Web search", "Create image", "Create PDF"]
 ANSWER_STYLES = {
     "Normal": "",
@@ -48,7 +59,7 @@ FONT_FILES = [  # optional Unicode font for Hindi text in PDFs, placed in a "fon
 MAX_TOKENS = 4096
 MEMORY_WINDOW = 40  # recent messages sent with each request
 MAX_UPLOAD_MB = 10
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}  # Claude only
 SEARCH_HINT = "\nYou can search the web. Use it for anything recent or uncertain, and name your sources."
 
 # Requests such as "create an image of a fox", "image banao neon city", "sunset ki photo banao".
@@ -70,7 +81,7 @@ PDF_PATTERN = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Settings and access
+# Settings, access, and clients
 # ---------------------------------------------------------------------------
 
 def get_secret(name, default=None):
@@ -97,7 +108,10 @@ def require_password():
     st.stop()
 
 
-def make_client():
+def make_client(provider):
+    if provider == GEMINI:
+        key = get_secret("GEMINI_API_KEY")
+        return genai.Client(api_key=key) if key else None
     key = get_secret("ANTHROPIC_API_KEY")
     return anthropic.Anthropic(api_key=key) if key else None
 
@@ -110,48 +124,97 @@ def build_system_prompt(mode, style):
     return "\n\n".join(parts)
 
 
+def friendly_error(err):
+    text = str(err)
+    if "429" in text or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower():
+        return "Free limit abhi khatam hai. Thodi der baad try karo, ya sidebar me dusra model chuno."
+    if "404" in text or "NOT_FOUND" in text:
+        return "Model ID nahi mila. Sidebar me 'Custom' chuno aur sahi model ID daalo."
+    if any(code in text for code in ("401", "403", "API_KEY", "invalid x-api-key", "PERMISSION_DENIED")):
+        return "API key galat ya band hai. Secrets me key check karo."
+    return text
+
+
+def test_connection(provider, client, model):
+    try:
+        if provider == GEMINI:
+            reply = client.models.generate_content(model=model, contents="Reply with the word OK.")
+            return True, (reply.text or "").strip()
+        reply = client.messages.create(
+            model=model, max_tokens=20, messages=[{"role": "user", "content": "Reply with the word OK."}]
+        )
+        return True, reply.content[0].text.strip()
+    except Exception as err:
+        return False, friendly_error(err)
+
+
 # ---------------------------------------------------------------------------
-# Claude helpers
+# Chat helpers for both providers
 # ---------------------------------------------------------------------------
 
-def attachment_block(uploaded):
-    ext = uploaded.name.rsplit(".", 1)[-1].lower()
-    mime = FILE_MIME[ext]
-    data = base64.b64encode(uploaded.getvalue()).decode("ascii")
-    kind = "document" if mime == "application/pdf" else "image"
-    return {"type": kind, "source": {"type": "base64", "media_type": mime, "data": data}}
+def recent_turns():
+    """Last saved messages, starting with a user turn."""
+    turns = st.session_state.messages[-MEMORY_WINDOW:]
+    while turns and turns[0]["role"] != "user":  # a conversation must open with a user turn
+        turns = turns[1:]
+    return turns
 
 
-def api_messages(text, uploaded=None):
-    """Saved chat (text only) plus the new message, with the attached file if there is one."""
-    history = st.session_state.messages[-MEMORY_WINDOW:]
-    while history and history[0]["role"] != "user":  # a conversation must open with a user turn
-        history = history[1:]
-    messages = [{"role": m["role"], "content": m["content"]} for m in history]
+def file_mime(uploaded):
+    return FILE_MIME[uploaded.name.rsplit(".", 1)[-1].lower()]
+
+
+def gemini_contents(text, uploaded=None):
+    contents = [
+        types.Content(
+            role="model" if m["role"] == "assistant" else "user",
+            parts=[types.Part(text=m["content"])],
+        )
+        for m in recent_turns()
+    ]
+    parts = []
+    if uploaded is not None:
+        parts.append(types.Part.from_bytes(data=uploaded.getvalue(), mime_type=file_mime(uploaded)))
+    parts.append(types.Part(text=text))
+    contents.append(types.Content(role="user", parts=parts))
+    return contents
+
+
+def gemini_config(system, search=False):
+    return types.GenerateContentConfig(
+        system_instruction=system,
+        max_output_tokens=MAX_TOKENS,
+        tools=[types.Tool(google_search=types.GoogleSearch())] if search else None,
+    )
+
+
+def gemini_sources(response):
+    sources, seen = [], set()
+    candidates = response.candidates or []
+    meta = getattr(candidates[0], "grounding_metadata", None) if candidates else None
+    for chunk in getattr(meta, "grounding_chunks", None) or []:
+        web = getattr(chunk, "web", None)
+        uri = getattr(web, "uri", None)
+        if uri and uri not in seen:
+            seen.add(uri)
+            sources.append((getattr(web, "title", None) or uri, uri))
+    return sources
+
+
+def claude_messages(text, uploaded=None):
+    messages = [{"role": m["role"], "content": m["content"]} for m in recent_turns()]
     content = []
     if uploaded is not None:
-        content.append(attachment_block(uploaded))
+        mime = file_mime(uploaded)
+        data = base64.b64encode(uploaded.getvalue()).decode("ascii")
+        kind = "document" if mime == "application/pdf" else "image"
+        content.append({"type": kind, "source": {"type": "base64", "media_type": mime, "data": data}})
     content.append({"type": "text", "text": text})
     messages.append({"role": "user", "content": content})
     return messages
 
 
-def claude_text(client, model, system, messages, tools=None):
-    """Non-streaming call. Resumes long web searches that pause mid-turn."""
-    while True:
-        extra = {"tools": tools} if tools else {}
-        response = client.messages.create(
-            model=model, max_tokens=MAX_TOKENS, system=system, messages=messages, **extra
-        )
-        if response.stop_reason != "pause_turn":
-            break
-        messages = messages + [{"role": "assistant", "content": response.content}]
-    text = "".join(block.text for block in response.content if block.type == "text")
-    return text, response
-
-
-def extract_sources(response):
-    """Unique (title, url) pairs from the web search results in a response."""
+def claude_sources(response):
     sources, seen = [], set()
     for block in response.content:
         if block.type != "web_search_tool_result" or not isinstance(block.content, list):
@@ -162,6 +225,42 @@ def extract_sources(response):
                 seen.add(url)
                 sources.append((getattr(item, "title", None) or url, url))
     return sources
+
+
+def stream_text(provider, client, model, system, text, uploaded=None):
+    """Yields reply text as it arrives, for either provider."""
+    if provider == GEMINI:
+        for chunk in client.models.generate_content_stream(
+            model=model, contents=gemini_contents(text, uploaded), config=gemini_config(system)
+        ):
+            if chunk.text:
+                yield chunk.text
+    else:
+        with client.messages.stream(
+            model=model, max_tokens=MAX_TOKENS, system=system, messages=claude_messages(text, uploaded)
+        ) as stream:
+            yield from stream.text_stream
+
+
+def complete_text(provider, client, model, system, text, uploaded=None, search=False):
+    """One non-streaming reply. Returns (text, sources), where sources are (title, url) pairs."""
+    if provider == GEMINI:
+        response = client.models.generate_content(
+            model=model, contents=gemini_contents(text, uploaded), config=gemini_config(system, search)
+        )
+        return response.text or "", gemini_sources(response)
+
+    extra = {"tools": [WEB_SEARCH_TOOL]} if search else {}
+    messages = claude_messages(text, uploaded)
+    while True:  # long web searches can pause mid-turn; resume them
+        response = client.messages.create(
+            model=model, max_tokens=MAX_TOKENS, system=system, messages=messages, **extra
+        )
+        if response.stop_reason != "pause_turn":
+            break
+        messages = messages + [{"role": "assistant", "content": response.content}]
+    answer = "".join(block.text for block in response.content if block.type == "text")
+    return answer, claude_sources(response)
 
 
 def sources_markdown(sources):
@@ -198,25 +297,41 @@ def render_message(msg, key):
                            mime="application/pdf", key=f"pdf_{key}")
 
 
-def run_chat(client, model, system, text, uploaded):
-    """Normal chat: tokens appear as they are generated."""
-    with client.messages.stream(
-        model=model, max_tokens=MAX_TOKENS, system=system, messages=api_messages(text, uploaded)
-    ) as stream:
-        answer = st.write_stream(stream.text_stream)
+def run_chat(settings, text, uploaded):
+    system = build_system_prompt(settings["mode"], settings["style"])
+    answer = st.write_stream(
+        stream_text(settings["provider"], settings["client"], settings["model"], system, text, uploaded)
+    )
     if not answer.strip():
         st.warning("Model ne khaali reply diya. Dobara try karo.")
         return None
     return {"role": "assistant", "content": answer, "image": None}
 
 
-def run_search(client, model, system, text, uploaded):
+def run_search(settings, text, uploaded):
+    system = build_system_prompt(settings["mode"], settings["style"]) + SEARCH_HINT
     with st.spinner("Searching the web..."):
-        answer, response = claude_text(
-            client, model, system + SEARCH_HINT, api_messages(text, uploaded), tools=[WEB_SEARCH_TOOL]
+        answer, sources = complete_text(
+            settings["provider"], settings["client"], settings["model"], system, text, uploaded, search=True
         )
-    reply = {"role": "assistant", "content": answer + sources_markdown(extract_sources(response)),
-             "image": None}
+    reply = {"role": "assistant", "content": answer + sources_markdown(sources), "image": None}
+    render_message(reply, key="new")
+    return reply
+
+
+def run_pdf_doc(settings, text, uploaded):
+    request = (
+        f"Write a complete, well-organised document in Markdown for this request:\n{text}\n\n"
+        "Use a title (#), headings (##) and bullet points where useful. Output only the document."
+    )
+    system = build_system_prompt(settings["mode"], settings["style"])
+    with st.spinner("Writing document..."):
+        document, _ = complete_text(
+            settings["provider"], settings["client"], settings["model"], system, request, uploaded
+        )
+    title = " ".join(text.split())[:80] or "Document"
+    reply = {"role": "assistant", "content": document, "pdf": build_pdf(title, document),
+             "pdf_name": "vortix_document.pdf"}
     render_message(reply, key="new")
     return reply
 
@@ -224,7 +339,7 @@ def run_search(client, model, system, text, uploaded):
 def run_image(subject):
     key = get_secret("OPENAI_API_KEY")
     if not key:
-        st.warning("Image creation ke liye OPENAI_API_KEY Secrets me add karo.")
+        st.warning("Image creation ke liye OPENAI_API_KEY Secrets me add karo (ye paid hai).")
         return None
     with st.spinner("Creating image..."):
         result = OpenAI(api_key=key).images.generate(model=IMAGE_MODEL, prompt=subject, size="1024x1024")
@@ -241,26 +356,12 @@ def run_image(subject):
     return reply
 
 
-def run_pdf_doc(client, model, system, text, uploaded):
-    request = (
-        f"Write a complete, well-organised document in Markdown for this request:\n{text}\n\n"
-        "Use a title (#), headings (##) and bullet points where useful. Output only the document."
-    )
-    with st.spinner("Writing document..."):
-        document, _ = claude_text(client, model, system, api_messages(request, uploaded))
-    title = " ".join(text.split())[:80] or "Document"
-    reply = {"role": "assistant", "content": document, "pdf": build_pdf(title, document),
-             "pdf_name": "vortix_document.pdf"}
-    render_message(reply, key="new")
-    return reply
-
-
-def handle_prompt(client, model, feature, mode, style, text, uploaded):
+def handle_prompt(settings, text, uploaded):
     stored_text = text + (f"\n\n[Attached: {uploaded.name}]" if uploaded is not None else "")
     with st.chat_message("user"):
         st.markdown(stored_text)
 
-    system = build_system_prompt(mode, style)
+    feature = settings["feature"]
     subject = image_subject(text) if feature == "Chat" else None
     wants_pdf = feature == "Create PDF" or (feature == "Chat" and bool(PDF_PATTERN.search(text)))
     reply = None
@@ -269,15 +370,14 @@ def handle_prompt(client, model, feature, mode, style, text, uploaded):
             if feature == "Create image" or subject:
                 reply = run_image(subject or text)
             elif wants_pdf:
-                reply = run_pdf_doc(client, model, system, text, uploaded)
+                reply = run_pdf_doc(settings, text, uploaded)
             elif feature == "Web search":
-                reply = run_search(client, model, system, text, uploaded)
+                reply = run_search(settings, text, uploaded)
             else:
-                reply = run_chat(client, model, system, text, uploaded)
-        except anthropic.APIError as err:
-            st.error(f"API error: {err}")
+                reply = run_chat(settings, text, uploaded)
         except Exception as err:  # show problems on screen instead of crashing the app
-            st.error(f"Error: {err}")
+            hint = friendly_error(err)
+            st.error(hint if hint == str(err) else f"{hint}\n\nDetail: {err}")
 
     if reply:
         st.session_state.messages.append({"role": "user", "content": stored_text, "image": None})
@@ -347,26 +447,28 @@ def valid_chat(data):
     )
 
 
-def sidebar_controls(client):
+def sidebar_controls():
     with st.sidebar:
         st.header(APP_NAME)
         feature = st.selectbox("Feature", FEATURES)
-        mode = st.selectbox("Assistant mode (120+)", list(MODES))
-        style = st.selectbox("Answer style", list(ANSWER_STYLES))
-        choice = st.selectbox("Claude model", CLAUDE_MODELS + ["Custom"])
+        provider = st.selectbox("AI provider", PROVIDERS)
+        choice = st.selectbox("Model", MODELS[provider] + ["Custom"])
         model = choice
         if choice == "Custom":
-            model = st.text_input("Custom model name", value=CLAUDE_MODELS[0]).strip()
+            model = st.text_input("Custom model ID", value=MODELS[provider][0]).strip()
+        mode = st.selectbox("Assistant mode (120+)", list(MODES))
+        style = st.selectbox("Answer style", list(ANSWER_STYLES))
+        client = make_client(provider)
 
         if st.button("Test API connection"):
-            try:
-                test = client.messages.create(
-                    model=model, max_tokens=20,
-                    messages=[{"role": "user", "content": "Reply with the word OK."}],
-                )
-                st.success(f"Connected: {test.content[0].text.strip()}")
-            except anthropic.APIError as err:
-                st.error(f"Connection failed: {err}")
+            if client is None:
+                st.error(f"{MISSING_KEY[provider]} Secrets me nahi mili.")
+            else:
+                ok, info = test_connection(provider, client, model)
+                if ok:
+                    st.success(f"Connected: {info}")
+                else:
+                    st.error(info)
 
         st.divider()
         if st.button("New chat"):
@@ -380,7 +482,8 @@ def sidebar_controls(client):
             )
             st.download_button("Download chat as PDF", data=build_pdf(f"{APP_NAME} chat", transcript),
                                file_name="vortix_chat.pdf", mime="application/pdf", key="export_pdf")
-            st.download_button("Save chat (JSON)", data=json.dumps(plain_messages(), ensure_ascii=False, indent=2),
+            st.download_button("Save chat (JSON)",
+                               data=json.dumps(plain_messages(), ensure_ascii=False, indent=2),
                                file_name="vortix_chat.json", mime="application/json", key="export_json")
 
         loaded = st.file_uploader("Load saved chat (JSON)", type=["json"], key="chat_loader")
@@ -395,7 +498,9 @@ def sidebar_controls(client):
                 st.success("Chat load ho gayi.")
             else:
                 st.error("Ye file saved chat JSON jaisi nahi lagti.")
-    return feature, mode, style, model
+
+    return {"feature": feature, "provider": provider, "model": model,
+            "mode": mode, "style": style, "client": client}
 
 
 def attachment_panel():
@@ -411,16 +516,14 @@ def attachment_panel():
 
 def main():
     require_password()
-
-    client = make_client()
-    if client is None:
-        st.error("ANTHROPIC_API_KEY nahi mili. Manage app → ⋮ → Settings → Secrets me key add karo.")
-        st.stop()
-
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    feature, mode, style, model = sidebar_controls(client)
+    settings = sidebar_controls()
+    if settings["client"] is None:
+        st.error(f"{MISSING_KEY[settings['provider']]} nahi mili. Manage app → ⋮ → Settings → Secrets me key add karo.")
+        st.stop()
+
     st.title(f"⚡ {APP_NAME}")
     uploaded = attachment_panel()
 
@@ -430,7 +533,7 @@ def main():
 
     prompt = st.chat_input("Ask Vortix anything, or say 'create an image of ...'")
     if prompt:
-        handle_prompt(client, model, feature, mode, style, prompt.strip(), uploaded)
+        handle_prompt(settings, prompt.strip(), uploaded)
 
 
 main()
